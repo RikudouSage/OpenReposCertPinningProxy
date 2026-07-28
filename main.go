@@ -36,7 +36,9 @@ func main() {
 
 	proxy := newProxy(targetURL, certPath)
 
-	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/robots.txt", robotsHandler)
+	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		proxy.ServeHTTP(writer, request)
 	})
 
@@ -48,6 +50,7 @@ func main() {
 
 		server := &http.Server{
 			Addr:              proxyAddr,
+			Handler:           noIndexHandler(mux),
 			ReadHeaderTimeout: 10 * time.Second,
 			IdleTimeout:       60 * time.Second,
 		}

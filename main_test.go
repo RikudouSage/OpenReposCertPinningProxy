@@ -19,6 +19,49 @@ import (
 	"time"
 )
 
+func TestRobotsHandler(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/robots.txt", nil)
+	recorder := httptest.NewRecorder()
+
+	robotsHandler(recorder, request)
+
+	response := recorder.Result()
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", response.StatusCode)
+	}
+	if got := response.Header.Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Fatalf("unexpected content type: %q", got)
+	}
+	if got := response.Header.Get("X-Robots-Tag"); got != robotsHeaderValue {
+		t.Fatalf("unexpected X-Robots-Tag: %q", got)
+	}
+	if got := recorder.Body.String(); got != "User-agent: *\nDisallow: /" {
+		t.Fatalf("unexpected robots.txt body: %q", got)
+	}
+}
+
+func TestNoIndexHandler(t *testing.T) {
+	handler := noIndexHandler(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/anything", nil)
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, request)
+
+	response := recorder.Result()
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("unexpected status: %d", response.StatusCode)
+	}
+	if got := response.Header.Get("X-Robots-Tag"); got != robotsHeaderValue {
+		t.Fatalf("unexpected X-Robots-Tag: %q", got)
+	}
+}
+
 func TestRewriteRequestHeadersForUpstream(t *testing.T) {
 	targetURL := mustParseURL(t, "https://openrepos.net")
 	inboundRequest, err := http.NewRequest(http.MethodPost, "http://localhost:8080/user/login", nil)

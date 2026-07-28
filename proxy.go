@@ -33,6 +33,7 @@ func newProxy(targetURL *url.URL, certPath string) *httputil.ReverseProxy {
 	}
 
 	proxy.ModifyResponse = func(response *http.Response) error {
+		response.Header.Set("X-Robots-Tag", robotsHeaderValue)
 		rewriteCookies(response, targetURL)
 
 		location := response.Header.Get("Location")
