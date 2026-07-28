@@ -2,10 +2,21 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestRewriteRequestHeadersForUpstream(t *testing.T) {
@@ -40,7 +51,7 @@ func TestRewriteRequestHeadersForUpstream(t *testing.T) {
 
 func TestProxyRewriteUsesUpstreamForwardedHostAndStoresProxyOrigin(t *testing.T) {
 	targetURL := mustParseURL(t, "https://openrepos.net")
-	proxy := newProxy(targetURL)
+	proxy := newProxy(targetURL, t.TempDir()+"/cert")
 	inboundRequest, err := http.NewRequest(http.MethodGet, "http://localhost:8080/user/login", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +88,7 @@ func TestProxyRewriteUsesUpstreamForwardedHostAndStoresProxyOrigin(t *testing.T)
 
 func TestProxyRewriteUsesForwardedProtoFromTLSProxy(t *testing.T) {
 	targetURL := mustParseURL(t, "https://openrepos.net")
-	proxy := newProxy(targetURL)
+	proxy := newProxy(targetURL, t.TempDir()+"/cert")
 	inboundRequest, err := http.NewRequest(http.MethodGet, "http://localhost:8080/user/login", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +111,7 @@ func TestProxyRewriteUsesForwardedProtoFromTLSProxy(t *testing.T) {
 
 func TestProxyRewriteIgnoresForwardedProtoFromUntrustedRemote(t *testing.T) {
 	targetURL := mustParseURL(t, "https://openrepos.net")
-	proxy := newProxy(targetURL)
+	proxy := newProxy(targetURL, t.TempDir()+"/cert")
 	inboundRequest, err := http.NewRequest(http.MethodGet, "http://localhost:8080/user/login", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -192,6 +203,133 @@ func TestRewriteCookiesPreservesSecureSameSiteNoneForHTTPSProxy(t *testing.T) {
 	}
 }
 
+func TestCertificateTrackingTransportRetriesMatchingExpiredCertificate(t *testing.T) {
+	expiredCertificate, certificatePool := newExpiredLocalhostCertificate(t)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{expiredCertificate}}
+	server.StartTLS()
+	defer server.Close()
+
+	certPath := t.TempDir() + "/openrepos-cert"
+	if err := os.WriteFile(certPath, []byte(certificateFingerprint(expiredCertificate.Leaf)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	baseTransport.TLSClientConfig = &tls.Config{
+		RootCAs:    certificatePool,
+		ServerName: "127.0.0.1",
+	}
+	transport := &certificateTrackingTransport{
+		base:       baseTransport,
+		targetHost: "127.0.0.1",
+		certPath:   certPath,
+		debounce:   certificateUpdateDebounce,
+		now:        time.Now,
+	}
+	client := &http.Client{Transport: transport}
+
+	response, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("unexpected status: %d", response.StatusCode)
+	}
+}
+
+func TestCertificateTrackingTransportCachesExpiredCertificateTrust(t *testing.T) {
+	expiredCertificate, certificatePool := newExpiredLocalhostCertificate(t)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{expiredCertificate}}
+	server.StartTLS()
+	defer server.Close()
+
+	certPath := t.TempDir() + "/openrepos-cert"
+	if err := os.WriteFile(certPath, []byte(certificateFingerprint(expiredCertificate.Leaf)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	baseTransport.TLSClientConfig = &tls.Config{
+		RootCAs:    certificatePool,
+		ServerName: "127.0.0.1",
+	}
+	var dialCount int64
+	dialer := &net.Dialer{}
+	baseTransport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
+		atomic.AddInt64(&dialCount, 1)
+		return dialer.DialContext(ctx, network, address)
+	}
+	transport := &certificateTrackingTransport{
+		base:       baseTransport,
+		targetHost: "127.0.0.1",
+		certPath:   certPath,
+		debounce:   certificateUpdateDebounce,
+		now:        time.Now,
+	}
+	client := &http.Client{Transport: transport}
+
+	response, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if got := atomic.LoadInt64(&dialCount); got != 2 {
+		t.Fatalf("expected first request to use verified attempt and retry, got %d dials", got)
+	}
+
+	response, err = client.Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if got := atomic.LoadInt64(&dialCount); got != 3 {
+		t.Fatalf("expected second request to go straight to expired-cert path, got %d total dials", got)
+	}
+}
+
+func TestCertificateTrackingTransportRejectsMismatchedExpiredCertificate(t *testing.T) {
+	expiredCertificate, certificatePool := newExpiredLocalhostCertificate(t)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{expiredCertificate}}
+	server.StartTLS()
+	defer server.Close()
+
+	certPath := t.TempDir() + "/openrepos-cert"
+	if err := os.WriteFile(certPath, []byte("not-the-certificate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	baseTransport.TLSClientConfig = &tls.Config{
+		RootCAs:    certificatePool,
+		ServerName: "127.0.0.1",
+	}
+	transport := &certificateTrackingTransport{
+		base:       baseTransport,
+		targetHost: "127.0.0.1",
+		certPath:   certPath,
+		debounce:   certificateUpdateDebounce,
+		now:        time.Now,
+	}
+	client := &http.Client{Transport: transport}
+
+	response, err := client.Get(server.URL)
+	if err == nil {
+		response.Body.Close()
+		t.Fatal("expected request to fail")
+	}
+}
+
 func mustParseURL(t *testing.T, rawURL string) *url.URL {
 	t.Helper()
 
@@ -201,4 +339,61 @@ func mustParseURL(t *testing.T, rawURL string) *url.URL {
 	}
 
 	return parsedURL
+}
+
+func newExpiredLocalhostCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Test CA"},
+		NotBefore:             time.Now().Add(-24 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCertificate, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-2 * time.Hour),
+		NotAfter:     time.Now().Add(-time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCertificate, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafCertificate, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	certificatePool := x509.NewCertPool()
+	certificatePool.AddCert(caCertificate)
+
+	return tls.Certificate{
+		Certificate: [][]byte{leafDER, caDER},
+		PrivateKey:  leafKey,
+		Leaf:        leafCertificate,
+	}, certificatePool
 }
