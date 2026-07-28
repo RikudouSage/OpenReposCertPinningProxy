@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,6 +65,89 @@ func TestNoIndexHandler(t *testing.T) {
 	}
 }
 
+func TestPrependInfoHeaderForHTMLResponse(t *testing.T) {
+	response := &http.Response{
+		Header: http.Header{
+			"Content-Type": {"text/html; charset=utf-8"},
+		},
+		Body: io.NopCloser(strings.NewReader("<html><body class=\"page\"><main>Content</main></body></html>")),
+	}
+
+	if err := prependInfoHeader(response); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(body), "<body class=\"page\"><div") {
+		t.Fatalf("info header was not inserted after body tag: %s", body)
+	}
+	if !strings.Contains(string(body), "https://openrepos.net/") {
+		t.Fatalf("canonical link missing from info header: %s", body)
+	}
+	if got := response.Header.Get("Content-Length"); got == "" {
+		t.Fatal("expected Content-Length to be updated")
+	}
+}
+
+func TestPrependInfoHeaderSkipsJSONResponse(t *testing.T) {
+	originalBody := `{"ok":true}`
+	response := &http.Response{
+		Header: http.Header{
+			"Content-Type": {"application/json"},
+		},
+		Body: io.NopCloser(strings.NewReader(originalBody)),
+	}
+
+	if err := prependInfoHeader(response); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != originalBody {
+		t.Fatalf("unexpected body: %s", body)
+	}
+}
+
+func TestPrependInfoHeaderSkipsCompressedResponse(t *testing.T) {
+	originalBody := "<html><body>compressed</body></html>"
+	response := &http.Response{
+		Header: http.Header{
+			"Content-Type":     {"text/html"},
+			"Content-Encoding": {"gzip"},
+		},
+		Body: io.NopCloser(strings.NewReader(originalBody)),
+	}
+
+	if err := prependInfoHeader(response); err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != originalBody {
+		t.Fatalf("unexpected body: %s", body)
+	}
+	if got := response.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("unexpected Content-Encoding: %q", got)
+	}
+}
+
+func TestInsertAfterBodyTagSkipsBodylessHTML(t *testing.T) {
+	originalBody := []byte("<html><main>Content</main></html>")
+	if got := insertAfterBodyTag(originalBody, []byte("header")); !bytes.Equal(got, originalBody) {
+		t.Fatalf("unexpected body: %s", got)
+	}
+}
+
 func TestRewriteRequestHeadersForUpstream(t *testing.T) {
 	targetURL := mustParseURL(t, "https://openrepos.net")
 	inboundRequest, err := http.NewRequest(http.MethodPost, "http://localhost:8080/user/login", nil)
@@ -72,6 +158,7 @@ func TestRewriteRequestHeadersForUpstream(t *testing.T) {
 	inboundRequest.Header.Set("Origin", "http://localhost:8080")
 	inboundRequest.Header.Set("Referer", "http://localhost:8080/user/login")
 	inboundRequest.Header.Set("Cookie", "SESSabc=123")
+	inboundRequest.Header.Set("Accept-Encoding", "gzip")
 
 	outboundRequest := inboundRequest.Clone(inboundRequest.Context())
 	request := &httputil.ProxyRequest{
@@ -89,6 +176,9 @@ func TestRewriteRequestHeadersForUpstream(t *testing.T) {
 	}
 	if got := outboundRequest.Header.Get("Cookie"); got != "SESSabc=123" {
 		t.Fatalf("unexpected Cookie: %q", got)
+	}
+	if got := outboundRequest.Header.Get("Accept-Encoding"); got != "" {
+		t.Fatalf("unexpected Accept-Encoding: %q", got)
 	}
 }
 

@@ -53,7 +53,7 @@ func newProxy(targetURL *url.URL, certPath string) *httputil.ReverseProxy {
 			}
 		}
 
-		return nil
+		return prependInfoHeader(response)
 	}
 
 	return proxy
@@ -103,6 +103,7 @@ func isAllowedProxy(remoteAddr string) bool {
 }
 
 func rewriteRequestHeaders(request *httputil.ProxyRequest, targetURL *url.URL) {
+	request.Out.Header.Del("Accept-Encoding")
 	rewriteRequestURLHeader(request.Out.Header, "Origin", request.In, targetURL)
 	rewriteRequestURLHeader(request.Out.Header, "Referer", request.In, targetURL)
 
