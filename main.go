@@ -15,11 +15,6 @@ import (
 const baseURL = "https://openrepos.net"
 const defaultProxyAddr = ":8080"
 
-var allowedProxies = []string{
-	"127.0.0.1",
-	"::1",
-}
-
 func main() {
 	gracefulShutdown := make(chan os.Signal, 1)
 	signal.Notify(gracefulShutdown, syscall.SIGINT, syscall.SIGTERM)

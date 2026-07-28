@@ -280,6 +280,17 @@ func TestIsAllowedProxySupportsCIDR(t *testing.T) {
 	}
 }
 
+func TestSplitTrustedProxies(t *testing.T) {
+	proxies := splitTrustedProxies("127.0.0.1, 192.168.48.0/20,, ::1 ")
+
+	if len(proxies) != 3 {
+		t.Fatalf("expected 3 proxies, got %d: %#v", len(proxies), proxies)
+	}
+	if proxies[0] != "127.0.0.1" || proxies[1] != "192.168.48.0/20" || proxies[2] != "::1" {
+		t.Fatalf("unexpected proxies: %#v", proxies)
+	}
+}
+
 func TestRewriteCookiesForLocalHTTPProxy(t *testing.T) {
 	targetURL := mustParseURL(t, "https://openrepos.net")
 	request, err := http.NewRequest(http.MethodGet, "https://openrepos.net/user/login", nil)
