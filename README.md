@@ -2,6 +2,8 @@
 
 Small reverse proxy for [openrepos.net](https://openrepos.net/). It exists as a backup path when the upstream TLS certificate expires.
 
+Live instance: [openrepos.rikudou.dev](https://openrepos.rikudou.dev/).
+
 ## What it does
 
 - Proxies all requests to `https://openrepos.net`.
