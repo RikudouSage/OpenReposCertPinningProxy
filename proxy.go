@@ -35,22 +35,8 @@ func newProxy(targetURL *url.URL, certPath string) *httputil.ReverseProxy {
 	proxy.ModifyResponse = func(response *http.Response) error {
 		response.Header.Set("X-Robots-Tag", robotsHeaderValue)
 		rewriteCookies(response, targetURL)
-
-		location := response.Header.Get("Location")
-		if location != "" {
-			redirectURL, err := url.Parse(location)
-			if err == nil && strings.EqualFold(redirectURL.Host, targetURL.Host) {
-				redirectURL.Scheme = proxyScheme(response.Request)
-				if redirectURL.Scheme == "" {
-					redirectURL.Scheme = "http"
-				}
-				redirectURL.Host = proxyHost(response.Request)
-				if redirectURL.Host == "" {
-					redirectURL.Host = response.Request.Host
-				}
-
-				response.Header.Set("Location", redirectURL.String())
-			}
+		if err := rewriteResponseURLs(response, targetURL); err != nil {
+			return err
 		}
 
 		return prependInfoHeader(response)
